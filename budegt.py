@@ -5,10 +5,7 @@ from prophet import Prophet
 import re
 import io
 import contextlib
-
-from langchain_community.chat_models import ChatOpenAI
-from langchain_experimental.agents import create_pandas_dataframe_agent
-from langchain.agents.agent_types import AgentType
+from openai import OpenAI
 
 st.set_page_config(layout="wide")
 st.title("\U0001F4CA Budget & Procurement Dashboard with AI Insights")
@@ -106,42 +103,55 @@ with tab4:
 # ---------------- TAB 5 ----------------
 with tab5:
     st.subheader("\U0001F916 AI Chart Generator from Prompt")
+    
     if not user_api_key:
         st.warning("Please enter your OpenAI API key in the sidebar to use this feature.")
     else:
-        prompt = st.text_area("Ask anything about actual spend data:")
+        dataset_option = st.selectbox("Choose dataset", ["Spent", "Plan", "Budget"])
+        df = {"Spent": spent_df, "Plan": plan_df, "Budget": budget_df}[dataset_option]
+
+        prompt = st.text_area("Ask your question (e.g., 'Show a bar chart of Actual Spent by Department'):")
         if st.button("Generate Insight") and prompt:
-            try:
-                llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo", openai_api_key=user_api_key)
-                agent = create_pandas_dataframe_agent(
-                    llm, spent_df,
-                    agent_type=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
-                    allow_dangerous_code=True,
-                    verbose=True,
-                    handle_parsing_errors=True
-                )
-                code_prompt = (
-                    f"You are a Streamlit + Plotly Python analyst. "
-                    f"Given the following user query, write Python code to generate the chart using dataframe `df` with Streamlit.\n\n"
-                    f"Only output the code inside triple backticks.\n\n"
-                    f"User Query: {prompt}"
-                )
-                result = agent.run(code_prompt)
+            client = OpenAI(api_key=user_api_key)
 
-                match = re.search(r"```(?:python)?\\n(.*?)```", result, re.DOTALL)
-                if match:
-                    code = match.group(1)
+            def get_code_from_ai(user_prompt, df_columns):
+                full_prompt = (
+                    f"You are a Streamlit + Plotly expert.\n"
+                    f"The DataFrame is called `df` and has these columns:\n{', '.join(df_columns)}\n\n"
+                    f"Use ONLY the above column names.\n"
+                    f"Return working Python code inside triple backticks ONLY, no explanation.\n\n"
+                    f"User prompt: {user_prompt}"
+                )
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=[{"role": "user", "content": full_prompt}],
+                    temperature=0,
+                )
+                return response.choices[0].message.content
+
+            def extract_code_blocks(text):
+                match = re.search(r"```(?:python)?\n(.*?)```", text, re.DOTALL)
+                return match.group(1).strip() if match else None
+
+            with st.spinner("Getting AI response..."):
+                response_text = get_code_from_ai(prompt, df.columns)
+                code = extract_code_blocks(response_text)
+
+                if not code:
+                    st.warning("No code block found. Retrying once...")
+                    response_text = get_code_from_ai(prompt, df.columns)
+                    code = extract_code_blocks(response_text)
+
+                if code:
                     st.code(code, language="python")
-                    with st.spinner("Generating chart..."):
-                        with contextlib.redirect_stdout(io.StringIO()) as f:
-                            exec_globals = {"df": spent_df, "pd": pd, "px": px, "st": st}
-                            exec(code, exec_globals)
-                        output = f.getvalue()
-                        if output:
-                            st.text(output)
+                    with st.spinner("Executing chart..."):
+                        try:
+                            exec_globals = {"df": df, "pd": pd, "px": px, "st": st}
+                            with contextlib.redirect_stdout(io.StringIO()) as f:
+                                exec(code, exec_globals)
+                            st.text(f.getvalue())
+                        except Exception as e:
+                            st.error(f"Code execution failed:\n{e}")
                 else:
-                    st.warning("No Python code found. Displaying raw output:")
-                    st.write(result)
-
-            except Exception as e:
-                st.error(f"Failed to process AI insight:\n{e}")
+                    st.error("AI did not return code even after retry.\nRaw response:")
+                    st.write(response_text)
